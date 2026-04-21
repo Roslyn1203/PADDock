@@ -1,4 +1,4 @@
-name: diffdock
+name: PADDock
 channels:
   - pytorch
   - defaults

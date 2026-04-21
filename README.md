@@ -31,19 +31,120 @@ conda activate PADDock
 - `train_ddpo.py`: main entry point for RL post-training
 - `inference_rl.py`: main entry point for inference and sampling
 - `pregenerate_cache.py`: optional cache pre-generation before training or inference
+- `pick_trainset.py`: utility for selecting a compact and diverse training subset
 - `datasets/`: scripts related to data and feature processing
 - `workdir/`: directory for checkpoints and model weights
 - `results/`: directory for training and inference outputs
 
+## Model Checkpoints and Git LFS
+
+Large model checkpoint files in this repository are tracked with Git LFS. To download them correctly, install Git LFS before cloning or pulling the repository:
+
+```bash
+git lfs install
+git clone https://github.com/Roslyn1203/PADDock.git
+cd PADDock
+git lfs pull
+```
+
+If the repository has already been cloned without downloading LFS files, run:
+
+```bash
+git lfs pull
+```
+
+The main checkpoint files are stored under:
+
+```text
+workdir/paper_confidence_model/
+workdir/paper_score_model/
+```
+
+If you only need the source code and want to skip downloading large checkpoint files, clone with:
+
+```bash
+GIT_LFS_SKIP_SMUDGE=1 git clone https://github.com/Roslyn1203/PADDock.git
+```
+
+You can later fetch the checkpoint files with `git lfs pull` when needed.
+
 ## Data Preparation
 
-Prepare the following components according to your experimental setup:
+### Dataset
 
-1. Dataset files, for example under `data/`
-2. Data split files for train/validation/test
-3. Protein and ligand inputs for inference, either as single examples or in CSV format
+The data used by this project follows the DiffDock-Pocket data release:
 
-If cached features or preprocessing artifacts are used, please ensure that all paths are consistent with your local configuration.
+- DiffDock-Pocket release: <https://github.com/plainerman/DiffDock-Pocket/releases/tag/v1.0.0>
+
+Download the dataset from the release page, extract it, and place the extracted files under:
+
+```text
+./data
+```
+
+After extraction, the repository should contain the required PDBBind-style data directories and split files used by the training and inference scripts. Please ensure that all paths are consistent with your local configuration.
+
+### ESM2 Embedding Preparation
+
+To reproduce the paper-style DiffDock numbers and use protein language model features, generate ESM2 embeddings for the proteins before training.
+
+First, prepare the FASTA file from the PDBBind structures:
+
+```bash
+python datasets/pdbbind_lm_embedding_preparation.py
+```
+
+This command generates:
+
+```text
+data/pdbbind_sequences.fasta
+```
+
+Next, install the official ESM repository from Meta AI:
+
+```text
+https://github.com/facebookresearch/esm
+```
+
+Inside the ESM repository, run:
+
+```bash
+python scripts/extract.py esm2_t33_650M_UR50D pdbbind_sequences.fasta embeddings_output --repr_layers 33 --include per_tok
+```
+
+This produces an `embeddings_output` directory. Copy this directory back into this repository so that the final path is:
+
+```text
+data/embeddings_output
+```
+
+Then convert the extracted ESM files into the packed `.pt` format used by this project:
+
+```bash
+python datasets/esm_embeddings_to_pt.py
+```
+
+By default, this creates:
+
+```text
+data/esm2_3billion_embeddings.pt
+```
+
+### Mini ESM Embedding File
+
+If you only need a smaller ESM embedding file for selected train/validation/test splits, first generate or obtain the full `data/embeddings_output` directory as described above, then run:
+
+```bash
+python datasets/make_mini_esm.py \
+  --esm_embeddings_path data/embeddings_output \
+  --output_path data/esm2_3billion_embeddings_mini.pt \
+  --split_files \
+    data/splits/timesplit_no_lig_overlap_train \
+    data/splits/timesplit_no_lig_overlap_val \
+    data/splits/timesplit_test
+```
+
+This packs only the protein-chain embeddings required by the specified split files.
 
 ## Optional: Cache Pre-generation
 
