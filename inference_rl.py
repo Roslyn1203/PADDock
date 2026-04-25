@@ -34,11 +34,10 @@ parser.add_argument('--save_visualisation', action='store_true', default=False, 
 parser.add_argument('--samples_per_complex', type=int, default=10, help='Number of samples to generate')
 
 parser.add_argument('--model_dir', type=str, default='workdir/paper_score_model', help='Path to folder with trained score model')
-parser.add_argument('--ckpt', type=str, default='best_ema_inference_epoch_model.pt', help='Checkpoint to use for the score model')
-
-# [Removed] all Confidence Model related arguments
-# parser.add_argument('--confidence_model_dir', ...)
-# parser.add_argument('--confidence_ckpt', ...)
+parser.add_argument('--ckpt', type=str, default='rl_model_epoch_70.pt', help='Checkpoint to use for the score model')
+parser.add_argument('--use_confidence', action='store_true', default=False, help='Enable confidence-based reranking')
+parser.add_argument('--confidence_model_dir', type=str, default='workdir/paper_confidence_model', help='Path to folder with trained confidence model and hyperparameters')
+parser.add_argument('--confidence_ckpt', type=str, default='best_model_epoch75.pt', help='Checkpoint to use for the confidence model')
 
 parser.add_argument('--batch_size', type=int, default=32, help='')
 parser.add_argument('--no_final_step_noise', action='store_true', default=False, help='Use no noise in the final step')
@@ -51,6 +50,12 @@ os.makedirs(args.out_dir, exist_ok=True)
 # Load Score Model arguments
 with open(f'{args.model_dir}/model_parameters.yml') as f:
     score_model_args = Namespace(**yaml.full_load(f))
+
+if args.use_confidence:
+    with open(f'{args.confidence_model_dir}/model_parameters.yml') as f:
+        confidence_args = Namespace(**yaml.full_load(f))
+else:
+    confidence_args = None
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -82,7 +87,23 @@ test_dataset = InferenceDataset(out_dir=args.out_dir, complex_names=complex_name
                                 atom_max_neighbors=score_model_args.atom_max_neighbors)
 test_loader = DataLoader(dataset=test_dataset, batch_size=1, shuffle=False)
 
-# [Removed] Confidence Dataset loading logic
+if args.use_confidence and not confidence_args.use_original_model_cache:
+    print('HAPPENING | confidence model uses different type of graphs than the score model. '
+          'Loading (or creating if not existing) the data for the confidence model now.')
+    confidence_test_dataset = InferenceDataset(out_dir=args.out_dir, complex_names=complex_name_list,
+                                               protein_files=protein_path_list,
+                                               ligand_descriptions=ligand_description_list,
+                                               protein_sequences=protein_sequence_list,
+                                               lm_embeddings=confidence_args.esm_embeddings_path is not None,
+                                               receptor_radius=confidence_args.receptor_radius,
+                                               remove_hs=confidence_args.remove_hs,
+                                               c_alpha_max_neighbors=confidence_args.c_alpha_max_neighbors,
+                                               all_atoms=confidence_args.all_atoms,
+                                               atom_radius=confidence_args.atom_radius,
+                                               atom_max_neighbors=confidence_args.atom_max_neighbors,
+                                               precomputed_lm_embeddings=test_dataset.lm_embeddings)
+else:
+    confidence_test_dataset = None
 
 t_to_sigma = partial(t_to_sigma_compl, args=score_model_args)
 
@@ -93,7 +114,14 @@ model.load_state_dict(state_dict, strict=True)
 model = model.to(device)
 model.eval()
 
-# [Removed] Confidence Model loading logic
+if args.use_confidence:
+    confidence_model = get_model(confidence_args, device, t_to_sigma=t_to_sigma, no_parallel=True, confidence_mode=True)
+    state_dict = torch.load(f'{args.confidence_model_dir}/{args.confidence_ckpt}', map_location=torch.device('cpu'))
+    confidence_model.load_state_dict(state_dict, strict=True)
+    confidence_model = confidence_model.to(device)
+    confidence_model.eval()
+else:
+    confidence_model = None
 
 tr_schedule = get_t_schedule(inference_steps=args.inference_steps)
 
@@ -109,6 +137,15 @@ for idx, orig_complex_graph in tqdm(enumerate(test_loader)):
     try:
         # Duplicate N copies for parallel pose generation
         data_list = [copy.deepcopy(orig_complex_graph) for _ in range(N)]
+        if confidence_test_dataset is not None:
+            confidence_complex_graph = confidence_test_dataset[idx]
+            if not confidence_complex_graph.success:
+                skipped += 1
+                print(f"HAPPENING | The confidence dataset did not contain {orig_complex_graph.name}. We are skipping this complex.")
+                continue
+            confidence_data_list = [copy.deepcopy(confidence_complex_graph) for _ in range(N)]
+        else:
+            confidence_data_list = None
         
         # Randomly initialize positions
         randomize_position(data_list, score_model_args.no_torsion, False, score_model_args.tr_sigma_max)
@@ -125,13 +162,7 @@ for idx, orig_complex_graph in tqdm(enumerate(test_loader)):
                 pdb.add((graph['ligand'].pos + graph.original_center).detach().cpu(), part=1, order=1)
                 visualization_list.append(pdb)
 
-        # -----------------------------------------------------------------------
-        # Call RL-modified sampling
-        # -----------------------------------------------------------------------
-        # Note: confidence_model is no longer passed here
-        # Return values: data_list (final poses), trajectories (log probs for RL)
-        # If doing inference only, you can ignore the second return value
-        data_list, trajectories = sampling_fn(
+        data_list, trajectories, confidence = sampling_fn(
             data_list=data_list, 
             model=model,
             inference_steps=args.actual_steps if args.actual_steps is not None else args.inference_steps,
@@ -142,25 +173,32 @@ for idx, orig_complex_graph in tqdm(enumerate(test_loader)):
             t_to_sigma=t_to_sigma, 
             model_args=score_model_args,
             batch_size=args.batch_size,
-            visualization_list=visualization_list # remove this if sampling_rl no longer accepts it
-            # confidence_model=None # removed
+            visualization_list=visualization_list,
+            confidence_model=confidence_model,
+            confidence_data_list=confidence_data_list,
+            confidence_model_args=confidence_args,
         )
         
         # Restore coordinates to original frame
         ligand_pos = np.asarray([complex_graph['ligand'].pos.cpu().numpy() + orig_complex_graph.original_center.cpu().numpy() for complex_graph in data_list])
-
-        # [Removed] confidence-based re-ranking logic
-        # In RL setup, we usually keep generation order or rank later by Vina
-        # Here we save outputs in generation order directly
+        if confidence is not None and isinstance(confidence_args.rmsd_classification_cutoff, list):
+            confidence = confidence[:, 0]
+        if confidence is not None:
+            confidence = confidence.cpu().numpy()
+            re_order = np.argsort(confidence)[::-1]
+            confidence = confidence[re_order]
+            ligand_pos = ligand_pos[re_order]
 
         # Save results
         write_dir = f'{args.out_dir}/{complex_name_list[idx]}'
         for rank, pos in enumerate(ligand_pos):
             mol_pred = copy.deepcopy(lig)
             if score_model_args.remove_hs: mol_pred = RemoveHs(mol_pred)
-            
-            # Filenames no longer include confidence, only rank index
-            write_mol_with_coords(mol_pred, pos, os.path.join(write_dir, f'sample_{rank}.sdf'))
+
+            if confidence is not None:
+                write_mol_with_coords(mol_pred, pos, os.path.join(write_dir, f'rank{rank+1}_confidence{confidence[rank]:.2f}.sdf'))
+            else:
+                write_mol_with_coords(mol_pred, pos, os.path.join(write_dir, f'sample_{rank}.sdf'))
 
         # Save visualization
         if args.save_visualisation and visualization_list is not None:

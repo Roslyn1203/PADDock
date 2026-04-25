@@ -5,9 +5,8 @@ from torch_geometric.loader import DataLoader
 from utils.diffusion_utils import modify_conformer, set_time
 from utils.torsion import modify_conformer_torsion_angles
 from scipy.spatial.transform import Rotation as R
-from torch.distributions import Normal
-import random
-import copy
+
+
 def randomize_position(data_list, no_torsion, no_random, tr_sigma_max):
     # in place modification of the list
     if not no_torsion:
@@ -33,9 +32,10 @@ def randomize_position(data_list, no_torsion, no_random, tr_sigma_max):
 
 
 def sampling_rl(data_list, model, inference_steps, tr_schedule, rot_schedule, tor_schedule, device, t_to_sigma, model_args,
-            batch_size=32, visualization_list=None):
+                batch_size=32, visualization_list=None, confidence_model=None, confidence_data_list=None,
+                confidence_model_args=None):
     N = len(data_list)
-    trajectory_data = [] 
+    trajectory_data = []
 
     for t_idx in range(inference_steps):
         t_tr, t_rot, t_tor = tr_schedule[t_idx], rot_schedule[t_idx], tor_schedule[t_idx]
@@ -54,11 +54,6 @@ def sampling_rl(data_list, model, inference_steps, tr_schedule, rot_schedule, to
         step_tor_action = []    
         step_tor_log_prob = []  
         step_tor_indices = []
-        
-        # New: reference score storage for debugging
-        step_ref_tr_score = []
-        step_ref_rot_score = []
-        step_ref_tor_score = []
 
         for complex_graph_batch in loader:
             b = complex_graph_batch.num_graphs
@@ -83,11 +78,6 @@ def sampling_rl(data_list, model, inference_steps, tr_schedule, rot_schedule, to
             rot_score_c = soft_clean(rot_score)
             tor_score_c = soft_clean(tor_score)
             
-            # Store reference values for update-time debug comparison
-            # step_ref_tr_score.append(tr_score_c)
-            # step_ref_rot_score.append(rot_score_c)
-            # step_ref_tor_score.append(tor_score_c)
-
             # 3. Prepare coefficients (use torch to avoid precision drift)
             tr_g = tr_sigma * torch.sqrt(torch.tensor(2 * np.log(model_args.tr_sigma_max / model_args.tr_sigma_min)))
             rot_g = 2 * rot_sigma * torch.sqrt(torch.tensor(np.log(model_args.rot_sigma_max / model_args.rot_sigma_min)))
@@ -146,6 +136,11 @@ def sampling_rl(data_list, model, inference_steps, tr_schedule, rot_schedule, to
                 new_graph = modify_conformer(graph, current_tr_p, current_rot_p, p_tor.numpy() if p_tor is not None else None)
                 new_data_list.append(new_graph)
 
+        if visualization_list is not None:
+            for idx, visualization in enumerate(visualization_list):
+                visualization.add((new_data_list[idx]['ligand'].pos + new_data_list[idx].original_center).detach().cpu(),
+                                  part=1, order=t_idx + 2)
+
         # Save trajectory step and ensure tensors are offloaded from GPU
         step_info = {
             't_idx': t_idx,
@@ -159,11 +154,6 @@ def sampling_rl(data_list, model, inference_steps, tr_schedule, rot_schedule, to
             'log_prob_rot': torch.cat(step_rot_log_prob, dim=0).cpu(),
             'log_prob_tor': (torch.cat(step_tor_log_prob, dim=0) if not model_args.no_torsion else torch.zeros(N)).cpu(),
             'tor_indices': step_tor_indices if not model_args.no_torsion else [],
-            
-            # If enabling debug fields, also force .cpu()
-            # 'ref_tr_score': torch.cat(step_ref_tr_score, dim=0).cpu() if 'step_ref_tr_score' in locals() else None,
-            # 'ref_rot_score': torch.cat(step_ref_rot_score, dim=0).cpu() if 'step_ref_rot_score' in locals() else None,
-            # 'ref_tor_score': torch.cat(step_ref_tor_score, dim=0).cpu() if 'step_ref_tor_score' in locals() else None,
         }
         if not model_args.no_torsion: 
             step_info['action_tor'] = torch.cat(step_tor_action, dim=0).cpu()
@@ -171,4 +161,24 @@ def sampling_rl(data_list, model, inference_steps, tr_schedule, rot_schedule, to
         trajectory_data.append(step_info)
         data_list = new_data_list
 
-    return data_list, trajectory_data
+    with torch.no_grad():
+        if confidence_model is not None:
+            loader = DataLoader(data_list, batch_size=batch_size, shuffle=False)
+            confidence_loader = iter(DataLoader(confidence_data_list, batch_size=batch_size, shuffle=False)) \
+                if confidence_data_list is not None else None
+            confidence = []
+            for complex_graph_batch in loader:
+                b = complex_graph_batch.num_graphs
+                complex_graph_batch = complex_graph_batch.to(device)
+                if confidence_data_list is not None:
+                    confidence_complex_graph_batch = next(confidence_loader).to(device)
+                    confidence_complex_graph_batch['ligand'].pos = complex_graph_batch['ligand'].pos
+                    set_time(confidence_complex_graph_batch, 0, 0, 0, b, confidence_model_args.all_atoms, device)
+                    confidence.append(confidence_model(confidence_complex_graph_batch))
+                else:
+                    confidence.append(confidence_model(complex_graph_batch))
+            confidence = torch.cat(confidence, dim=0)
+        else:
+            confidence = None
+
+    return data_list, trajectory_data, confidence
