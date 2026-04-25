@@ -139,9 +139,9 @@ python datasets/make_mini_esm.py \
   --esm_embeddings_path data/embeddings_output \
   --output_path data/esm2_3billion_embeddings_mini.pt \
   --split_files \
-    data/splits/timesplit_no_lig_overlap_train \
-    data/splits/timesplit_no_lig_overlap_val \
-    data/splits/timesplit_test
+    data/splits/filtered_train \
+    data/splits/filtered_val \
+    data/splits/filtered_test
 ```
 
 This packs only the protein-chain embeddings required by the specified split files.
